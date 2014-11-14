@@ -4,7 +4,7 @@ BUILD_ROOT := $(shell pwd)/../
 include ../fdw.mk
 
 CXXFLAGS += $(GTEST_CFLAGS) $(COMMON_CFLAGS)
-LDFLAGS += $(GTEST_LDFLAGS) $(COMMON_LDFLAGS)
+LDFLAGS += $(GTEST_LDFLAGS) $(GTEST_RPATH_WL) $(COMMON_LDFLAGS)
 
 TESTS := *_test.hh
 
