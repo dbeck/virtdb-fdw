@@ -22,15 +22,20 @@ EXTRA_CLEAN := $(EXTENSION)--$(EXTVERSION).sql \
 PG_CONFIG ?= $(shell which pg_config)
 ifeq ($(PG_CONFIG), )
 $(info $$PG_CONFIG is [${PG_CONFIG}])
-PG_CONFIG = $(shell which /usr/local/pgsql/bin/pg_config)
+PG_CONFIG = $(shell which pg_config)
 endif
 
 COMMON_LIB := $(BUILD_ROOT)/common/libcommon.a
 PROTO_LIB := $(BUILD_ROOT)/common/proto/libproto.a
 
+ifeq ($(PG_CONFIG), )
+$(info $$PG_CONFIG is [${PG_CONFIG}])
+$(error need pg_config executable to build the foreign data wrapper. please pass its location on the PG_CONFIG variable or make sure it can be found in the PATH)
+endif
+
 PGXS := $(shell $(PG_CONFIG) --pgxs)
-PG_CPPFLAGS := $(ZMQ_CFLAGS) $(PROTOBUF_CFLAGS)
-PG_LIBS := -lstdc++ $(ZMQ_LDFLAGS) $(PROTOBUF_LDFLAGS) $(COMMON_LIB) $(PROTO_LIB)
+PG_CPPFLAGS := $(ZMQ_CFLAGS) $(PROTOBUF_CFLAGS) $(SODIUM_CFLAGS)
+PG_LIBS := -lstdc++ $(ZMQ_LDFLAGS) $(SODIUM_LDFLAGS) $(PROTOBUF_LDFLAGS) $(COMMON_LIB) $(PROTO_LIB)
 
 include $(PGXS)
 
@@ -38,10 +43,15 @@ CXX ?= g++
 
 $(COMMON_LIB) $(PROTO_LIB): $(PROTOBUF_HEADERS)
 
+ifeq ($(RELEASE), 1)
+LDFLAGS += $(PG_LIBS) -O3
+OLDCFLAGS := $(CFLAGS:-O2=-O3)
+override CFLAGS := $(OLDCFLAGS) -O3
+else
 LDFLAGS += $(PG_LIBS) -g3
-
 OLDCFLAGS := $(CFLAGS:-O2=-O0)
 override CFLAGS := $(OLDCFLAGS) -g3
+endif
 
 $(info $$CFLAGS is [${CFLAGS}])
 $(info $$LDFLAGS is [${LDFLAGS}])
@@ -55,7 +65,7 @@ test-build-clean:
 	make -C test/ clean
 
 common-build-all:
-	cd $(BUILD_ROOT)/common; make -f common.mk all
+	cd $(BUILD_ROOT)/common; make -f common.mk all RELEASE=1
 
 $(PROTOBUF_HEADERS): $(PROTOBUF_PROTOS)
 	cd $(BUILD_ROOT)/common; make -f common.mk all

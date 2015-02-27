@@ -65,8 +65,8 @@ using namespace virtdb;
 using namespace virtdb::connector;
 using namespace virtdb::engine;
 
-endpoint_client* ep_client;
-log_record_client* log_client;
+endpoint_client* ep_client = nullptr;
+log_record_client* log_client = nullptr;
 
 namespace virtdb_fdw_priv {
 
@@ -75,10 +75,29 @@ struct provider {
     receiver_thread* worker_thread = nullptr;
     push_client<virtdb::interface::pb::Query>* query_push_client = nullptr;
     sub_client<virtdb::interface::pb::Column>* column_sub_client = nullptr;
+    
+    ~provider()
+    {
+	delete query_push_client;
+	delete column_sub_client;
+	delete worker_thread;
+    }
 };
 
-provider* current_provider;
+provider* current_provider = nullptr;
 std::map<std::string, provider> providers;
+
+static void
+onError(std::string message = "")
+{
+//    delete current_provider;
+//    current_provider = nullptr;
+    delete log_client;
+    log_client = nullptr;
+    delete ep_client;
+    ep_client = nullptr;
+    elog(ERROR, "Error happened %s", message.c_str());
+}
 
 std::string getOption(const std::string& option_name, List* list)
 {
@@ -135,21 +154,13 @@ cbGetForeignRelSize( PlannerInfo *root,
             elog(LOG, "Config server url: %s", config_server_url.c_str());
             if (config_server_url != "")
             {
-                ep_client = new endpoint_client(config_server_url,
-                                                "postgres_generic_fdw",
-                                                5,     // retry count on 0MQ exception
-                                                false  // shall kill the process by re-throwing?
-                                                );
+                ep_client = new endpoint_client(config_server_url, "postgres_generic_fdw");
             }
         }
 
         if (log_client == nullptr)
         {
-            log_client = new log_record_client(*ep_client,
-                                               "diag-service",
-                                               5,     // retry count on 0MQ exception
-                                               false  // shall kill the process by re-throwing?
-                                               );
+            log_client = new log_record_client(*ep_client, "diag-service");
 
             if( !log_client->wait_valid_push(timeout) )
             {
@@ -199,7 +210,7 @@ cbGetForeignRelSize( PlannerInfo *root,
     }
     catch(const std::exception & e)
     {
-        LOG_ERROR("Internal error." << E_(e));
+        onError(e.what());
     }
 
 }
@@ -223,7 +234,7 @@ cbGetForeignPaths( PlannerInfo *root,
                  total_cost,
                  // no pathkeys:  TODO! check-this!
                  NIL,
-                 NULL,
+                 nullptr,
                  // no outer rel either:  TODO! check-this!
                  NIL
             )));
@@ -240,7 +251,7 @@ static ForeignScan
                    List *scan_clauses )
 {
     Index scan_relid = baserel->relid;
-    if (scan_clauses != NULL)
+    if (scan_clauses != nullptr)
     {
         elog(LOG, "[%s] - Length of clauses BEFORE extraction: %d",
                     __func__, scan_clauses->length);
@@ -248,7 +259,7 @@ static ForeignScan
 
     // Remove pseudo-constant clauses
     scan_clauses = extract_actual_clauses(scan_clauses, false);
-    if (scan_clauses != NULL)
+    if (scan_clauses != nullptr)
     {
         elog(LOG, "[%s] - Length of clauses AFTER extraction: %d",
                     __func__, scan_clauses->length);
@@ -256,7 +267,7 @@ static ForeignScan
 
     // 1. make sure floating point representation doesn't trick us
     // 2. only set the limit if this is a single table
-    List* limit = NULL;
+    List* limit = nullptr;
     size_t nrels = bms_num_members(root->all_baserels);
     if( nrels == 1 && root->limit_tuples > 0.9 )
     {
@@ -332,12 +343,8 @@ cbBeginForeignScan( ForeignScanState *node,
         virtdb::engine::query query_data;
 
         // Table name
-        std::string table_name{RelationGetRelationName(node->ss.ss_currentRelation)};
-        for (auto& c: table_name)
-        {
-            c = ::toupper(c);
-        }
-        query_data.set_table_name( table_name );
+        auto foreign_table_id = RelationGetRelid(node->ss.ss_currentRelation);
+        query_data.set_table_name(getTableOption("remotename", foreign_table_id));
 
         // Columns
         int n = node->ss.ps.plan->targetlist->length;
@@ -379,7 +386,6 @@ cbBeginForeignScan( ForeignScanState *node,
         }
 
         // Schema
-        auto foreign_table_id = RelationGetRelid(node->ss.ss_currentRelation);
         query_data.set_schema(getTableOption("schema", foreign_table_id));
 
         // UserToken
@@ -394,7 +400,7 @@ cbBeginForeignScan( ForeignScanState *node,
     }
     catch(const std::exception & e)
     {
-        LOG_ERROR("Internal error" << E_(e));
+	onError(e.what());
     }
 }
 
@@ -403,12 +409,12 @@ cbIterateForeignScan(ForeignScanState *node)
 {
     struct AttInMetadata * meta = TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
     data_handler* handler = current_provider->worker_thread->get_data_handler(reinterpret_cast<long>(node));
-    if (handler->read_next())
+    try
     {
-        TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-        ExecClearTuple(slot);
-        try
+        if (handler->read_next())
         {
+            TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+            ExecClearTuple(slot);
             for (int column_id : handler->column_ids())
             {
                 slot->tts_isnull[column_id] = true;
@@ -517,18 +523,20 @@ cbIterateForeignScan(ForeignScanState *node)
                 }
             }
             ExecStoreVirtualTuple(slot);
+            return slot;
         }
-        // catch(const std::logic_error & e)
-        catch(const std::exception& e)
+        else
         {
-            LOG_ERROR("Internal error" << E_(e));
+            // return nullptr if there is no more data.
+            LOG_TRACE("Finished loading data." << V_(handler->query_id()));
+            return nullptr;
         }
-        return slot;
     }
-    else
+    // catch(const std::logic_error & e)
+    catch(const std::exception& e)
     {
-        // return NULL if there is no more data.
-        return NULL;
+	onError(e.what());
+	return nullptr;
     }
 }
 
@@ -545,7 +553,6 @@ cbEndForeignScan(ForeignScanState *node)
 }
 
 }
-
 // C++ implementation of the forward declared function
 extern "C" {
 
@@ -555,9 +562,6 @@ void PG_init_virtdb_fdw_cpp(void)
 
 void PG_fini_virtdb_fdw_cpp(void)
 {
-    // delete current_provider->worker_thread;
-    // delete log_client;
-    // delete ep_client;
 }
 
 Datum virtdb_fdw_status_cpp(PG_FUNCTION_ARGS)
@@ -580,6 +584,7 @@ static struct fdwOption valid_options[] =
 	{ "url",  ForeignDataWrapperRelationId },
     { "provider", ForeignTableRelationId },
     { "schema", ForeignTableRelationId },
+    { "remotename", ForeignTableRelationId },
 
 	/* Sentinel */
 	{ "",	InvalidOid }
@@ -598,21 +603,21 @@ Datum virtdb_fdw_handler_cpp(PG_FUNCTION_ARGS)
     fdw_routine->ReScanForeignScan    = virtdb_fdw_priv::cbReScanForeignScan;
     fdw_routine->EndForeignScan       = virtdb_fdw_priv::cbEndForeignScan;
 
-    // optional fields will be NULL for now
-    fdw_routine->AddForeignUpdateTargets  = NULL;
-    fdw_routine->PlanForeignModify        = NULL;
-    fdw_routine->BeginForeignModify       = NULL;
-    fdw_routine->ExecForeignInsert        = NULL;
-    fdw_routine->ExecForeignUpdate        = NULL;
-    fdw_routine->ExecForeignDelete        = NULL;
-    fdw_routine->EndForeignModify         = NULL;
+    // optional fields will be nullptr for now
+    fdw_routine->AddForeignUpdateTargets  = nullptr;
+    fdw_routine->PlanForeignModify        = nullptr;
+    fdw_routine->BeginForeignModify       = nullptr;
+    fdw_routine->ExecForeignInsert        = nullptr;
+    fdw_routine->ExecForeignUpdate        = nullptr;
+    fdw_routine->ExecForeignDelete        = nullptr;
+    fdw_routine->EndForeignModify         = nullptr;
 
     // optional EXPLAIN support is also omitted
-    fdw_routine->ExplainForeignScan    = NULL;
-    fdw_routine->ExplainForeignModify  = NULL;
+    fdw_routine->ExplainForeignScan    = nullptr;
+    fdw_routine->ExplainForeignModify  = nullptr;
 
     // optional ANALYZE support is also omitted
-    fdw_routine->AnalyzeForeignTable  = NULL;
+    fdw_routine->AnalyzeForeignTable  = nullptr;
 
     PG_RETURN_POINTER(fdw_routine);
 }
